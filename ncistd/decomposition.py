@@ -1,9 +1,11 @@
-import warnings
+import logging
+import multiprocessing as mp
+import numbers
+import time
 
 import numpy as np
 import opt_einsum as oe
 import tensorly as tl
-from tensorly import check_random_state
 from tensorly.decomposition._base_decomposition import DecompositionMixin
 from tensorly.decomposition._cp import initialize_cp
 from threadpoolctl import threadpool_limits
@@ -11,6 +13,7 @@ from threadpoolctl import threadpool_limits
 from .fista import fista_solve
 from .tensors import SparseCPTensor
 
+logger = logging.getLogger(__name__)
 
 def _create_mttkrp_function(shape, rank):
     """Helper function to generate the function for calculating the Matricized
@@ -54,7 +57,6 @@ def als_lasso(
     n_iter_max=1000,  
     random_state=None, 
     threads=None, 
-    verbose=0, 
     return_losses=False
 ):
     """Computes a rank-`rank` decomposition of `tensor` such that::
@@ -111,8 +113,6 @@ def als_lasso(
     threads : int, default is None
         Maximum number of threads allocated to the algorithm. If `threads`=None, 
         then all available threads will be used.
-    verbose : int, default is 0
-        Level of verbosity.
     return_losses : bool, default is False
         Activate return of iteration loss values at each iteration.
         
@@ -174,13 +174,11 @@ def als_lasso(
         
         # begin iterations
         for iteration in range(n_iter_max):
-            if verbose > 2:
-                print('\nStarting iteration {}'.format(iteration), flush=True)
+            logger.debug('Starting iteration %s', iteration)
                 
             # loop through modes
             for mode in range(n_modes):
-                if verbose > 3:
-                    print('\tMode {} of {}'.format(mode, n_modes), flush=True)
+                logger.debug('\tMode %s of %s', mode, n_modes)
 
                 # form DtD, containing kr_product.T @ kr_product
                 DtD = np.ones((rank, rank))
@@ -227,14 +225,11 @@ def als_lasso(
             loss = sse + penalties
             # append loss to history
             losses.append(loss)
-            if verbose > 1:
-                print('loss: {}'.format(losses[-1]), flush=True)
+            logger.debug('loss: %s', losses[-1])
             
             # stop iterations if loss has acheived zero 
             if loss == 0.0:
-                if verbose > 0:
-                    message = 'Algorithm converged after {} iterations'.format(iteration+1)
-                    print(message, flush=True)
+                logger.info('Algorithm converged after %s iterations', iteration+1)
                 break
             
             # check convergence
@@ -243,16 +238,11 @@ def als_lasso(
                 loss_change = abs(losses[-2] - losses[-1]) / max(losses[-1], 1)
                 # compare change in loss to tolerance
                 if loss_change < tol:
-                    if verbose > 0:
-                        message = 'Algorithm converged after {} iterations'.format(iteration+1)
-                        print(message, flush=True)
+                    logger.info('Algorithm converged after %s iterations', iteration+1)
                     break
                 # close out with warnings if the iteration maximum has been reached
                 elif iteration == n_iter_max - 1:
-                    message = 'Algorithm failed to converge after {} iterations'.format(iteration+1)
-                    if verbose > 0:
-                        print(message, flush=True)
-                    warnings.warn(message)
+                    logger.warning('Algorithm failed to converge after %s iterations', iteration+1)
         
         # return result
         if return_losses:
@@ -364,7 +354,8 @@ class SparseCP(DecompositionMixin):
         self, 
         tensor, 
         threads=None, 
-        verbose=0, 
+        initialization_processes=1, 
+        shutdown_event=None, 
         return_losses=False
     ):
         """Fits `n_initializations` sparse tensor decomposition models to the
@@ -380,8 +371,11 @@ class SparseCP(DecompositionMixin):
         threads : int, default is None
             Maximum number of threads allocated to the algorithm. If 
             `threads`=None, then all available threads will be used.
-        verbose : int, default is 0
-            Level of verbosity.
+        initialization_processes : int, default is 1
+            Number of initializations to run in parallel procesess.
+        shutdown_event : multiprocessing.managers.EventProxy, default is None
+            Event which can be set to gracefully shut down the
+            multiprocessing.Pool of parallel initialization worker processes.
         return_losses : bool, default is False
             Activate return of iteration loss values at each iteration.
             
@@ -396,6 +390,9 @@ class SparseCP(DecompositionMixin):
             A list of loss values calculated at each iteration of the algorithm. 
             Only returned when `return_losses` is set to True.
         """
+        if (shutdown_event is not None) and not isinstance(shutdown_event, mp.managers.EventProxy):
+            raise TypeError("shutdown_event must be None or a multiprocessing.managers.EventProxy")
+
         # initialize lists of candidate cp_tensors and their losses
         candidates = list()
         candidate_losses = list()
@@ -403,37 +400,75 @@ class SparseCP(DecompositionMixin):
         # initialize lowest error
         lowest_err = float('inf')
         
-        # initialize random state
-        rns = check_random_state(self.random_state)
-        
-        # run multiple initializations
+        initialization_processes = min(self.n_initializations, initialization_processes)
+
+        # set up random state for multiple initializations
+        child_seeds = []
+        if self.random_state is None:
+            child_seeds = [None] * self.n_initializations
+        else:
+            if isinstance(self.random_state, numbers.Integral):
+                seed = self.random_state
+            elif isinstance(self.random_state, np.random.RandomState):
+                seed = self.random_state.randint(0, 2**32-1)
+            else:
+                raise TypeError('incorrect random_state type')
+            for i in range(self.n_initializations):
+                # manage uint32 overflow
+                child_seeds.append(int(np.array(seed + i).astype(np.uint32)))
+
+        # configure args for multiple initializations
+        args = []
         for i in range(self.n_initializations):
-            if verbose > 0:
-                print('\nBeginning initialization {} of {}'.format(
-                    i+1, self.n_initializations))
-            # fit model
-            cp, loss = als_lasso(
-                tensor, 
-                self.rank, 
-                self.lambdas, 
-                nonneg_modes=self.nonneg_modes, 
-                norm_constraint=self.norm_constraint, 
-                init=self.init, 
-                tol=self.tol, 
-                n_iter_max=self.n_iter_max, 
-                random_state=rns, 
-                threads=threads, 
-                verbose=verbose - 1, 
-                return_losses=True
-            )
-            # store candidates
-            candidates.append(cp)
-            candidate_losses.append(loss)
-            # keep best fit
+            args.append({
+                "i": i,
+                "total_inits": self.n_initializations,
+                "als_lasso_kwargs": {
+                    'tensor': tensor,
+                    'rank': self.rank,
+                    'lambdas': self.lambdas,
+                    'nonneg_modes': self.nonneg_modes,
+                    'norm_constraint': self.norm_constraint,
+                    'init': self.init,
+                    'tol': self.tol,
+                    'n_iter_max': self.n_iter_max,
+                    'threads': threads,
+                    'return_losses': True,
+                    'random_state': child_seeds[i]
+                }
+            })
+
+        def shutdown():
+            return (shutdown_event is not None) and shutdown_event.is_set()
+
+        # run multiple initializations
+        results = {}
+        if initialization_processes > 1:
+            if not shutdown():
+                with mp.get_context("spawn").Pool(processes=initialization_processes) as pool:
+                    futures = [pool.apply_async(_als_lasso_job_runner, (a,)) for a in args]
+                    while not shutdown() and len(results) < len(futures):
+                        for i, fut in enumerate(futures):
+                            if (i not in results) and fut.ready():
+                                results[i] = fut.get()
+                        time.sleep(0.1)
+                    # If any workers are still running (shutdown() == True), leaving
+                    # the context manager here will stop them with SIGTERM
+            if shutdown():
+                return None
+        else:
+            # no need for process pool
+            results = {i: r for (i, r) in enumerate(map(_als_lasso_job_runner, args))}
+
+        for i in sorted(results.keys()):
+            candidates.append(results[i][0])
+            candidate_losses.append(results[i][1])
+        # keep best fit
+        for i, loss in enumerate(candidate_losses):
             if loss[-1] < lowest_err:
                 lowest_err = loss[-1]
                 best_cp_index = i
-        
+
         # store results
         self.candidates_ = candidates
         self.candidate_losses_ = candidate_losses
@@ -444,4 +479,17 @@ class SparseCP(DecompositionMixin):
             return candidates[best_cp_index], candidate_losses[best_cp_index]
         else:
             return candidates[best_cp_index]
-    
+
+
+def _als_lasso_job_runner(kwargs):
+    i = kwargs["i"]
+    n = kwargs["total_inits"]
+    als_lasso_kwargs = kwargs["als_lasso_kwargs"]
+    logger.info('Beginning initialization %s of %s (random_state=%s)',
+        i+1, n, als_lasso_kwargs["random_state"])
+    t0 = time.perf_counter()
+    results = als_lasso(**als_lasso_kwargs)
+    elapsed_s = time.perf_counter() - t0
+    logger.info('Completed initialization %d of %d in %s seconds',
+        i+1, n, elapsed_s)
+    return results
